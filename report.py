@@ -162,9 +162,11 @@ def report2html(name, report):
             <td style="padding-left: 3px; padding-right: 3px;border: 1px solid black;border-collapse: collapse;"><b>Created</b></td>
             <td style="padding-left: 3px; padding-right: 3px;border: 1px solid black;border-collapse: collapse;"><b>Access Key(s)</b></td>
             <td style="padding-left: 3px; padding-right: 3px;border: 1px solid black;border-collapse: collapse;"><b>Password</b></td>
+            <td style="padding-left: 3px; padding-right: 3px;border: 1px solid black;border-collapse: collapse;"><b>MFA Enabled</b></td>
             <td style="padding-left: 3px; padding-right: 3px;border: 1px solid black;border-collapse: collapse;"><b>Last changed</b></td>
             <td style="padding-left: 3px; padding-right: 3px;border: 1px solid black;border-collapse: collapse;"><b>Groups</b></td>
-            <td style="padding-left: 3px; padding-right: 3px;border: 1px solid black;border-collapse: collapse;"><b>Policies</b></td>
+            <td style="padding-left: 3px; padding-right: 3px;border: 1px solid black;border-collapse: collapse;"><b>Managed policies</b></td>
+            <td style="padding-left: 3px; padding-right: 3px;border: 1px solid black;border-collapse: collapse;"><b>Inline policies</b></td>            
             <td style="padding-left: 3px; padding-right: 3px;border: 1px solid black;border-collapse: collapse;"><b>Last Service used by an Access Key</b></td>
         </tr>
         {%- for row in rows %}
@@ -174,9 +176,11 @@ def report2html(name, report):
             <td style="padding-left: 3px; padding-right: 3px;border: 1px solid black;border-collapse: collapse;white-space:nowrap; text-align: right;">{{ row.created }}</td>
             <td style="padding-left: 3px; padding-right: 3px;border: 1px solid black;border-collapse: collapse;text-align: center;">{{ row.access_key }}</td>
             <td style="padding-left: 3px; padding-right: 3px;border: 1px solid black;border-collapse: collapse;text-align: center;">{{ row.password }}</td>
+            <td style="padding-left: 3px; padding-right: 3px;border: 1px solid black;border-collapse: collapse;text-align: center;">{{ row.mfa }}</td>
             <td style="padding-left: 3px; padding-right: 3px;border: 1px solid black;border-collapse: collapse;white-space:nowrap; text-align: {{ row.password_changed_align }};">{{ row.password_changed }}</td>
             <td style="padding-left: 3px; padding-right: 3px;border: 1px solid black;border-collapse: collapse;">{{ row.groups }}</td>
-            <td style="padding-left: 3px; padding-right: 3px;border: 1px solid black;border-collapse: collapse;">{{ row.policies }}</td>
+            <td style="padding-left: 3px; padding-right: 3px;border: 1px solid black;border-collapse: collapse;">{{ row.managedPolicies }}</td>
+            <td style="padding-left: 3px; padding-right: 3px;border: 1px solid black;border-collapse: collapse;">{{ row.customPolicies }}</td>
             <td style="padding-left: 3px; padding-right: 3px;border: 1px solid black;border-collapse: collapse;">{{ row.last_service }}</td>
         </tr>
         {%- endfor %}
@@ -201,10 +205,12 @@ def report2html(name, report):
             'created': '',
             'access_key': '',
             'password': '',
+            'mfa': '',
             'password_changed': '',
             'password_changed_align': 'right',
             'groups': ', '.join(user['groups']),
-            'policies': ', '.join(user['policies']),
+            'customPolicies': ', '.join(user['customPolicies']),
+            'managedPolicies': ', '.join(user['managedPolicies']),
             'last_service': '',
             'color': '#{:02x}{:02x}{:02x}'.format(*color_gradient[-1])
         }
@@ -218,6 +224,9 @@ def report2html(name, report):
         except ValueError:
             r['active'] = img['never']
             r['active_align'] = 'center'
+
+        if user['mfa_active']:
+            r['color'] = '#{:02x}{:02x}{:02x}'.format(255, 255, 255)
 
         if user['user'] == '<root_account>':
             r['color'] = '#{:02x}{:02x}{:02x}'.format(*color_gradient[0])
@@ -239,6 +248,7 @@ def report2html(name, report):
 
         r['access_key'] = img['true'] if user['access_key_1_active'] or user['access_key_2_active'] else img['false']
         r['password'] = img['true'] if user['password_enabled'] else img['false']
+        r['mfa'] = img['true'] if user['mfa_active'] else img['false']
         r['last_service'] = last_service(user)
 
         rows.append(r)
@@ -409,10 +419,13 @@ class UserReport:
                 user[key] = None
 
         user['groups'] = list()
-        user['policies'] = list()
+        user['customPolicies'] = list()
+        user['managedPolicies'] = list()
         try:
             user['groups'] = self.user_groups(user['user'])
-            user['policies'] = self.user_policies(user['user'])
+            user['customPolicies'] = self.user_customPolicies(user['user'])
+            user['managedPolicies'] = self.user_managedPolicies(user['user'])
+
         except botocore.exceptions.ClientError as e:
             if '(NoSuchEntity)' in str(e):
                 user['user'] += ' [DELETED]'
@@ -446,7 +459,33 @@ class UserReport:
                 ui.append(group['GroupName'])
         return ui
 
-    def user_policies(self, user):
+    # list_attached_user_policies (managed policies)
+    def user_managedPolicies(self, user):
+        if user == '<root_account>':
+            return []
+        self.log.debug('Fetching Policies for user {}'.format(user))
+        session = boto3.session.Session(aws_access_key_id=self._access_key_id,
+                                        aws_secret_access_key=self._secret_access_key)
+        iam = session.client('iam')
+        complete = False
+        marker = None
+        ui = []
+        while not complete:
+            if marker:
+                items = iam.list_attached_user_policies(UserName=user, Marker=marker)
+            else:
+                items = iam.list_attached_user_policies(UserName=user)
+            if items['IsTruncated']:
+                marker = items['Marker']
+            else:
+                complete = True
+
+            for group in items['AttachedPolicies']:
+                ui.append(group['PolicyName'])
+        return ui
+
+    # list_user_policies (inline policies)
+    def user_customPolicies(self, user):
         if user == '<root_account>':
             return []
         self.log.debug('Fetching Policies for user {}'.format(user))
